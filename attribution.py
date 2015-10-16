@@ -1,15 +1,19 @@
-#!/usr/bin/python3
+#!venv/bin/python3
 
 import csv
 import json
 import urllib
 import sqlite3
-#import requests
+import requests
+import socket
+socket.setdefaulttimeout(None)
+
 class Transaction():
     def __init__(self, trid, userid):
         self.trid = trid
         self.userid = userid
         self.products = []
+
 
 class Product():
     def __init__(self, prid, quantity, price):
@@ -29,44 +33,67 @@ class Attribution:
             'quantity',
             'price',
         ]
+        id_matching_filepath = self.fetch_id_matching()
+        self.transactions_filepath = self.fetch_transactions()
+        self.connection = sqlite3.connect(id_matching_filepath)
+        self.cursor = self.connection.cursor()
+        self._initialize_table()
+        self._import_transactions()
+        self._join_tables()
+        self.connection.commit()
 
-    def _get_new_id(self):
+    def _get_mapped_id(self, uid=None):
         s = requests.Session()
-        for _ in range(2):
-            r = s.get('http://gum.criteo.com/sync?c={client}&a=1'.format(client=gum_client_id))
+        url = 'http://gum.criteo.com/sync?c={client}'.format(client=gum_client_id)
+        if uid:
+            cookies = {'uid':uid}
+            r = s.get(url, cookies=cookies)
+        else:
+            for _ in range(2): # You need to sync twice to actually get an ID
+                r = s.get(url)
         return r.text
 
 
-    def _insert_values(self, cursor, values):
+    def _insert_values(self, values):
         sql = "INSERT INTO {tablename} ({columnnames}) VALUES ({qmarks});"
         sql = sql.format(
             tablename=self.transaction_table,
             columnnames=", ".join(self.column_names),
             qmarks=", ".join(['?' for _ in values]),
         )
-        cursor.execute(sql, tuple(values))
+        self.cursor.execute(sql, tuple(values))
 
-    # Download ID matching data
-    def download_id_matching(self):
-        pass
+    # Download ID matching data or use local file
+    def fetch_id_matching(self):
+        path = self.configuration['id_matching_url']
+        try:
+            local_filename, headers = urllib.request.urlretrieve(path)
+            return local_filename
+        except ValueError:
+            return path
 
-    # Download transactions data
-    def download_transactions(self):
-        pass
+    # Download transactions data or use local file
+    def fetch_transactions(self):
+        path = self.configuration['transactions_url']
+        try:
+            local_filename, headers = urllib.request.urlretrieve(path)
+            return local_filename
+        except ValueError:
+            return path
 
     # Clean the database before import
-    def _initialize_table(self, cursor):
+    def _initialize_table(self):
         # Initialize table
         sql = "DROP TABLE IF EXISTS {tablename}"
         sql = sql.format(tablename=self.transaction_table)
-        cursor.execute(sql)
+        self.cursor.execute(sql)
         sql = "CREATE TABLE {tablename} ({columnnames});"
         sql = sql.format(tablename=self.transaction_table, columnnames=", ".join(self.column_names))
-        cursor.execute(sql)
+        self.cursor.execute(sql)
     
     # Import the transactions from a file into the sqlite db
-    def _import_transactions(self, cursor):
-        with open('transactions.csv','r') as transactions_file: 
+    def _import_transactions(self):
+        with open(self.transactions_filepath,'r') as transactions_file: 
             transactions = csv.DictReader( #uses first line for column headings
                 transactions_file,
                 delimiter=',',
@@ -103,7 +130,7 @@ class Attribution:
                         quantity,
                         price,
                     ]
-                    self._insert_values(cursor, values)
+                    self._insert_values(values)
                 except KeyError:
                     pass
                 # Try with 0 as a suffix
@@ -119,7 +146,7 @@ class Attribution:
                         quantity,
                         price,
                     ]
-                    self._insert_values(cursor, values)
+                    self._insert_values(values)
                 except KeyError:
                     pass
                 # Now try with the other numbers
@@ -137,84 +164,66 @@ class Attribution:
                             quantity,
                             price,
                         ]
-                        self._insert_values(cursor, values)
+                        self._insert_values(values)
                 except KeyError:
                     pass
 
     # Join transactions and ID matching
-    def _join_tables(self, cursor):
+    def _join_tables(self):
         sql = """
         SELECT data.CriteoId, transactions.transaction_id, transactions.product_id, transactions.quantity, transactions.price
         FROM transactions
         LEFT JOIN data
         ON transactions.external_user_id=data.BusinessID;
         """
-        transactions = []
-        for row in cursor.execute(sql):
-            for transaction in transactions:
+        self.transactions = []
+        for row in self.cursor.execute(sql):
+            for transaction in self.transactions:
                 if transaction.trid == row[1] and transaction.userid == row[0]:
                     transaction.products.append(Product(row[2],row[3],row[4]))
                     break
             else:
                 transaction = Transaction(row[1], row[0])
                 transaction.products.append(Product(row[2],row[3],row[4]))
-                transactions.append(transaction)
-        print(transactions)
+                self.transactions.append(transaction)
 
     # Send list of events to Criteo servers
     def send_events(self):
-        connection = sqlite3.connect('data.db')
-        cursor = connection.cursor()
-        self._initialize_table(cursor)
-        self._import_transactions(cursor)
-        self._join_tables(cursor)
-        connection.commit()
-        #with open('input.csv') as csvfile:
-        #    reader = csv.DictReader(csvfile)
-        #    # Loop through rows
-        #    for row in reader:
-        #        # Build product list
-        #        products = []
-        #        product_number = 1
-        #        try:
-        #            while True:
-        #                products.append(
-        #                        {
-        #                            'id': row[product_id + str(product_number)].strip(),
-        #                            'price': row[price + str(product_number)].strip(),
-        #                            'quantity': row[quantity + str(product_number)].strip()
-        #                        }
-        #                )
-        #                product_number = product_number + 1
-        #        except(KeyError):
-        #            pass
-        #        # Build data object
-        #        if row[user_id].strip():
-        #            mapped_user_id = row[user_id].strip()
-        #        else:
-        #            mapped_user_id = _get_new_id()
-        #        data = {
-        #            "account": row[partner_id].strip(),
-        #            "id": {
-        #                "mapped_user_id": mapped_user_id,
-        #                "mapping_key": gum_client_id
-        #            },
-        #            "events": [
-        #                { 'event': "setHashedEmail", 'email': row[user_md5].strip() },
-        #                { 'event': "trackTransaction", 'item': products }
-        #            ]
-        #        }
-        #        # Pass data object
-        #        s = requests.Session()
-        #        encoded_data = urllib.parse.quote(json.dumps(data))
-        #        url = 'http://widget.criteo.com/m/event?version=s2s_v0&data={data}'.format(data=encoded_data)
-        #        s = s.get(url)
-        #
+        for transaction in self.transactions:
+            products = []
+            for product in transaction.products:
+                products.append(
+                    {
+                        'id': product.prid,
+                        'price': product.price,
+                        'quantity': product.quantity,
+                    }
+                )
+            data = {
+                "account": self.configuration['partner_id'],
+                "id": {
+                    "mapped_user_id": transaction.userid,
+                    "mapping_key": self.configuration['gum_client_id'],
+                },
+                "events": [
+                    #{ 'event': "setHashedEmail", 'email': row[user_md5].strip() },
+                    { 'event': "trackTransaction", 'id': transaction.trid, 'item': products },
+                ]
+            }
+            # Pass data object
+            session = requests.Session()
+            encoded_data = urllib.parse.quote(json.dumps(data))
+            url = 'http://widget.criteo.com/m/event?version=s2s_v0&data={data}'.format(data=encoded_data)
+            response = session.get(url)
+            print(response.text)
+
+
+
 
 configuration = {
-    "gum_client_id": '70', # GUM ID for 'Local (TS UK)'
+    "gum_client_id": '70', # 70 is GUM ID for 'Local (TS UK)'
     "partner_id": "976",
-    "transactions_url": "http://",
+    "transactions_url": "transactions.csv",
     "transactions_map": {
         "transaction_id": "transactionid",
         "external_user_id": "businessid",
@@ -223,7 +232,7 @@ configuration = {
         "quantity": "q",
         "price": "p",
     },
-    "id_matching_url": "http://",
+    "id_matching_url": "http://hartshorne.org/criteo/xmlbuilder/data/data.db",
     "id_matching_map": {
         "gum_user_id": "CriteoId",
         "external_user_id": "BusinessID",
